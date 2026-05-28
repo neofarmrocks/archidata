@@ -44,6 +44,7 @@ import org.atriasoft.archidata.dataAccess.options.OrderBy;
 import org.atriasoft.archidata.dataAccess.options.OverrideTableName;
 import org.atriasoft.archidata.dataAccess.options.QueryOption;
 import org.atriasoft.archidata.dataAccess.options.ReadAllColumn;
+import org.atriasoft.archidata.dataAccess.options.Skip;
 import org.atriasoft.archidata.dataAccess.options.TransmitKey;
 import org.atriasoft.archidata.db.DbConfig;
 import org.atriasoft.archidata.db.DbIo;
@@ -1629,6 +1630,13 @@ public class DBAccessMongo implements Closeable {
 					order.generateSort(sorts);
 				}
 				retFind = retFind.sort(sorts);
+			}
+
+			final List<Skip> skips = options.get(Skip.class);
+			if (skips.size() == 1) {
+				retFind = retFind.skip((int) skips.get(0).getValue());
+			} else if (skips.size() > 1) {
+				throw new DataAccessException("Request with multiple 'skip'...");
 			}
 
 			final List<Limit> limits = options.get(Limit.class);
