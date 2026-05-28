@@ -54,6 +54,26 @@ export interface RESTModel {
 export interface ModelResponseHttp {
   status: number;
   data: any;
+  // Response headers; populated for JSON responses so paginated helpers can
+  // read X-Total-Count and the RFC 5988 Link header.
+  headers?: Headers;
+}
+
+/**
+ * A paginated slice returned by a back-end endpoint that produces
+ * Pagination<T>. The server emits the items as a plain list body plus
+ * `X-Total-Count` and `Link` (RFC 5988) headers. `RESTRequestPaginatedJson`
+ * assembles them into this object.
+ */
+export interface Pagination<TYPE> {
+  items: TYPE[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+  // Raw Link header value, for clients that want to follow rel="next" etc.
+  linkHeader?: string;
 }
 
 export type ErrorRestApiCallback = (response: Response) => void;
@@ -347,7 +367,11 @@ export function RESTRequest({
             response
               .json()
               .then((value: any) => {
-                resolve({ status: response.status, data: value });
+                resolve({
+                  status: response.status,
+                  data: value,
+                  headers: response.headers,
+                });
               })
               .catch((reason: Error) => {
                 reject({
@@ -360,7 +384,11 @@ export function RESTRequest({
                 } as RestErrorResponse);
               });
           } else {
-            resolve({ status: response.status, data: response.body });
+            resolve({
+              status: response.status,
+              data: response.body,
+              headers: response.headers,
+            });
           }
         } else {
           // the answer is not correct not a 2XX
@@ -461,6 +489,90 @@ export function RESTRequestJson<TYPE>(
             message: 'api.ts Check type as fail',
           } as RestErrorResponse);
         }
+      })
+      .catch((reason: RestErrorResponse) => {
+        reject(reason);
+      });
+  });
+}
+
+/**
+ * Variant of {@link RESTRequestJson} for paginated endpoints.
+ *
+ * The server returns a plain `TYPE[]` body and exposes pagination metadata
+ * through the `X-Total-Count` and `Link` (RFC 5988) HTTP headers. This helper
+ * assembles them into a {@link Pagination} object.
+ *
+ * The caller can also pass `page.offset` / `page.limit` on a separate
+ * argument: they are mapped to the `X-Pagination-Offset` /
+ * `X-Pagination-Limit` HTTP headers on the request.
+ *
+ * @typeParam TYPE - the element type of the paginated list
+ * @param request - the underlying REST request (path, queries, body, …)
+ * @param checker - optional runtime validator for the items list
+ * @param page - optional pagination request input (offset / limit)
+ */
+export function RESTRequestPaginatedJson<TYPE>(
+  request: RESTRequestType,
+  checker?: (data: any) => data is TYPE[],
+  page?: { offset?: number; limit?: number }
+): Promise<Pagination<TYPE>> {
+  const requestWithPagination: RESTRequestType = {
+    ...request,
+    headers: {
+      ...(request.headers ?? {}),
+      ...(page?.offset !== undefined && {
+        'X-Pagination-Offset': String(page.offset),
+      }),
+      ...(page?.limit !== undefined && {
+        'X-Pagination-Limit': String(page.limit),
+      }),
+    },
+  };
+  return new Promise((resolve, reject) => {
+    RESTRequest(requestWithPagination)
+      .then((value: ModelResponseHttp) => {
+        if (!Array.isArray(value.data)) {
+          reject({
+            name: 'Pagination shape error',
+            time: Date().toString(),
+            status: 951,
+            error: 'Expected an array body for paginated endpoint',
+            statusMessage: 'API cast ERROR',
+            message: 'rest-tools.ts paginated body is not an array',
+          } as RestErrorResponse);
+          return;
+        }
+        if (!isNullOrUndefined(checker) && !checker(value.data)) {
+          reject({
+            name: 'Model check fail',
+            time: Date().toString(),
+            status: 950,
+            error: 'REST Fail to verify the data',
+            statusMessage: 'API cast ERROR',
+            message: 'rest-tools.ts paginated items check failed',
+          } as RestErrorResponse);
+          return;
+        }
+        const items = value.data as TYPE[];
+        const headers = value.headers;
+        const totalHeader = headers?.get('X-Total-Count');
+        const total =
+          totalHeader !== null && totalHeader !== undefined
+            ? Number(totalHeader)
+            : items.length;
+        const linkHeader = headers?.get('Link') ?? undefined;
+        const offset = page?.offset ?? 0;
+        const limit = page?.limit ?? items.length || 1;
+        resolve({
+          items,
+          total,
+          offset,
+          limit,
+          hasNext: linkHeader !== undefined && linkHeader.includes('rel="next"'),
+          hasPrev: linkHeader !== undefined && linkHeader.includes('rel="prev"'),
+          linkHeader,
+        });
       })
       .catch((reason: RestErrorResponse) => {
         reject(reason);

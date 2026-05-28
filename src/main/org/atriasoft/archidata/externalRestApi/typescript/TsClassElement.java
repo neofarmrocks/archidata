@@ -14,6 +14,7 @@ import java.util.TreeMap;
 import org.atriasoft.archidata.annotation.checker.ValidGroup;
 import org.atriasoft.archidata.externalRestApi.model.ClassEnumModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassListModel;
+import org.atriasoft.archidata.externalRestApi.model.ClassPaginationModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassMapModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassObjectModel;
@@ -975,6 +976,11 @@ public class TsClassElement {
 				return null;
 			}
 			if (models.get(0) instanceof ClassEnumModel) {
+				return null;
+			}
+			if (models.get(0) instanceof ClassPaginationModel) {
+				// Pagination<T> is rendered inline as Promise<Pagination<T>> by
+				// TsApiGeneration; no local zod model is needed.
 				return null;
 			}
 			if (models.get(0).getOriginClasses() == Void.class || models.get(0).getOriginClasses() == void.class) {

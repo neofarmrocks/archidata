@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.atriasoft.archidata.annotation.apiGenerator.ApiGenerationMode;
+import org.atriasoft.archidata.dataAccess.model.Pagination;
 import org.atriasoft.archidata.tools.AnnotationCreator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -84,6 +85,9 @@ public abstract class ClassModel {
 				}
 				if (Map.class.isAssignableFrom(rawClass)) {
 					return new ClassMapModel(typeArguments[0], typeArguments[1], previousModel);
+				}
+				if (Pagination.class.isAssignableFrom(rawClass)) {
+					return new ClassPaginationModel(paramType, previousModel);
 				}
 			}
 			throw new IOException("Fail to manage parametrized type... '" + rawType + "'");

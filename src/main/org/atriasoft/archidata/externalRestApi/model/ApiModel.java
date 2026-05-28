@@ -13,6 +13,8 @@ import java.util.stream.Collectors;
 
 import org.atriasoft.archidata.annotation.AnnotationTools;
 import org.atriasoft.archidata.annotation.checker.ValidGroup;
+import org.atriasoft.archidata.annotation.method.PaginationContext;
+import org.atriasoft.archidata.dataAccess.model.Pagination;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -108,6 +110,13 @@ public class ApiModel {
 			final ClassModel modelGenerated = ClassModel.getModel(listType, previousModel);
 			this.returnTypes.add(modelGenerated);
 			LOGGER.trace("Model List ==> {}", modelGenerated);
+			return;
+		} else if (returnTypeModelRaw == Pagination.class) {
+			LOGGER.trace("Model Pagination");
+			final Type paginationType = method.getGenericReturnType();
+			final ClassModel modelGenerated = ClassModel.getModel(paginationType, previousModel);
+			this.returnTypes.add(modelGenerated);
+			LOGGER.trace("Model Pagination ==> {}", modelGenerated);
 			return;
 		} else {
 			LOGGER.trace("Model Object");
@@ -211,6 +220,8 @@ public class ApiModel {
 				parameterModel.add(previousModel.add(parameterType));
 			}
 			final Context contextAnnotation = AnnotationTools.get(parameter, Context.class);
+			final PaginationContext paginationContextAnnotation = AnnotationTools.get(parameter,
+					PaginationContext.class);
 			final HeaderParam headerParam = AnnotationTools.get(parameter, HeaderParam.class);
 			final Valid validParam = AnnotationTools.get(parameter, Valid.class);
 			final ValidGroup validGroupParam = AnnotationTools.get(parameter, ValidGroup.class);
@@ -235,6 +246,9 @@ public class ApiModel {
 				}
 			} else if (contextAnnotation != null) {
 				// out of scope parameters
+			} else if (paginationContextAnnotation != null) {
+				// @PaginationContext: resolved server-side from request headers / query params,
+				// not exposed to the generated client signature.
 			} else if (headerParam != null) {
 				if (!this.headers.containsKey(headerParam.value())) {
 					this.headers.put(headerParam.value(),

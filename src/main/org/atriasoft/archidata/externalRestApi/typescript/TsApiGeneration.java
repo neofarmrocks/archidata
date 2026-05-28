@@ -16,6 +16,7 @@ import org.atriasoft.archidata.externalRestApi.model.ApiGroupModel;
 import org.atriasoft.archidata.externalRestApi.model.ApiModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassEnumModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassListModel;
+import org.atriasoft.archidata.externalRestApi.model.ClassPaginationModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassMapModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassModel;
 import org.atriasoft.archidata.externalRestApi.model.ClassObjectModel;
@@ -157,6 +158,34 @@ public class TsApiGeneration {
 	}
 
 	/**
+	 * Generates a TypeScript {@code Pagination<T>} type reference for a pagination model.
+	 *
+	 * <p>The {@code Pagination<T>} type itself is exported by the {@code rest-tools} module;
+	 * its import is added separately via the {@code toolImports} machinery in the caller.
+	 *
+	 * @param valid whether validation is active
+	 * @param groups the validation groups
+	 * @param model the pagination model
+	 * @param tsGroup the group registry for resolving type references
+	 * @param imports the import model to track dependencies
+	 * @param partialObject whether to generate as partial type
+	 * @return the TypeScript {@code Pagination<T>} type string
+	 */
+	public static String generateClassPaginationModelTypescript(
+			final boolean valid,
+			final Class<?>[] groups,
+			final ClassPaginationModel model,
+			final TsClassElementGroup tsGroup,
+			final ImportModel imports,
+			final boolean partialObject) {
+		final StringBuilder out = new StringBuilder();
+		out.append("Pagination<");
+		out.append(generateClassModelTypescript(valid, groups, model.valueModel, tsGroup, imports, partialObject));
+		out.append(">");
+		return out.toString();
+	}
+
+	/**
 	 * Generates a TypeScript type reference for any class model by dispatching to the appropriate handler.
 	 * @param valid whether validation is active
 	 * @param groups the validation groups
@@ -178,6 +207,10 @@ public class TsApiGeneration {
 		}
 		if (model instanceof final ClassListModel listModel) {
 			return generateClassListModelTypescript(valid, groups, listModel, tsGroup, imports, partialObject);
+		}
+		if (model instanceof final ClassPaginationModel paginationModel) {
+			return generateClassPaginationModelTypescript(valid, groups, paginationModel, tsGroup, imports,
+					partialObject);
 		}
 		if (model instanceof final ClassMapModel mapModel) {
 			return generateClassMapModelTypescript(valid, groups, mapModel, tsGroup, imports, partialObject);
@@ -387,6 +420,8 @@ public class TsApiGeneration {
 				data.append("\n\t\tcallbacks?: RESTCallbacks,");
 				toolImports.add("RESTCallbacks");
 			}
+			final boolean isPaginated = interfaceElement.returnTypes.stream()
+					.anyMatch(ClassPaginationModel.class::isInstance);
 			data.append("\n\t}): Promise<");
 			if (returnComplexModel != null) {
 				data.append(returnModelNameIfComplex);
@@ -402,6 +437,13 @@ public class TsApiGeneration {
 				if ("void".equals(returnType)) {
 					data.append("\n\t\treturn RESTRequestVoid({");
 					toolImports.add("RESTRequestVoid");
+				} else if (isPaginated) {
+					for (final ClassModel elem : interfaceElement.returnTypes) {
+						imports.addCheck(elem);
+					}
+					data.append("\n\t\treturn RESTRequestPaginatedJson({");
+					toolImports.add("RESTRequestPaginatedJson");
+					toolImports.add("Pagination");
 				} else {
 					for (final ClassModel elem : interfaceElement.returnTypes) {
 						imports.addCheck(elem);
@@ -481,6 +523,10 @@ public class TsApiGeneration {
 			} else if (returnComplexModel != null) {
 				data.append(", is");
 				data.append(returnModelNameIfComplex);
+			} else if (isPaginated) {
+				// Pagination<T> body is the plain item list; runtime body check
+				// is omitted in this version (Pagination<T> ships without a list
+				// checker today). The helper accepts an undefined checker.
 			} else {
 				final TsClassElement retType = tsGroup.find(interfaceElement.returnTypes.get(0));
 				if (retType.getCheckType() != null) {
