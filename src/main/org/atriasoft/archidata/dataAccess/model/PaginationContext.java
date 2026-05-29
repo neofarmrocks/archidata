@@ -26,6 +26,13 @@ public record PaginationContext(
 	public static final long DEFAULT_LIMIT = 50L;
 
 	/**
+	 * Server-side ceiling on the requested page size. A client asking for more
+	 * than this is clamped down to it, so a single request can never pull an
+	 * unbounded page. Resolved in {@code PaginationContextValueProvider}.
+	 */
+	public static final long MAX_LIMIT = 500L;
+
+	/**
 	 * Compact constructor enforcing the same range constraints as
 	 * {@link Skip} and {@link Limit}.
 	 */

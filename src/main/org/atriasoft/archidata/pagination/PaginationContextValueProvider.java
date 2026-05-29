@@ -89,7 +89,11 @@ public class PaginationContextValueProvider implements ValueParamProvider {
 		}
 		try {
 			final long parsed = Long.parseLong(raw);
-			return parsed > 0L ? parsed : fallback;
+			if (parsed <= 0L) {
+				return fallback;
+			}
+			// Clamp oversized page requests so a single call can never pull an unbounded page.
+			return Math.min(parsed, PaginationContext.MAX_LIMIT);
 		} catch (final NumberFormatException ex) {
 			LOGGER.warn("Ignoring non-numeric {} value '{}', falling back to {}", name, raw, fallback);
 			return fallback;
