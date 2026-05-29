@@ -563,7 +563,7 @@ export function RESTRequestPaginatedJson<TYPE>(
             : items.length;
         const linkHeader = headers?.get('Link') ?? undefined;
         const offset = page?.offset ?? 0;
-        const limit = page?.limit ?? items.length || 1;
+        const limit = page?.limit ?? (items.length || 1);
         resolve({
           items,
           total,
