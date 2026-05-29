@@ -32,9 +32,11 @@ public class CORSFilter implements ContainerResponseFilter {
 
 		response.getHeaders().add("Access-Control-Allow-Origin", "*");
 		response.getHeaders().add("Access-Control-Allow-Range", "bytes");
-		response.getHeaders().add("access-control-expose-headers", "range");
+		// Expose pagination metadata so cross-origin clients can read the total
+		// count and the RFC 5988 navigation links emitted by PaginationResponseFilter.
+		response.getHeaders().add("access-control-expose-headers", "range, X-Total-Count, Link");
 		response.getHeaders().add("Access-Control-Allow-Headers",
-				"Origin, content-type, Content-type, Accept, Authorization, mime-type, filename, Range");
+				"Origin, content-type, Content-type, Accept, Authorization, mime-type, filename, Range, X-Pagination-Offset, X-Pagination-Limit");
 		response.getHeaders().add("Access-Control-Allow-Credentials", "true");
 		response.getHeaders().add("Access-Control-Allow-Methods",
 				"GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, ARCHIVE, RESTORE, CALL");
