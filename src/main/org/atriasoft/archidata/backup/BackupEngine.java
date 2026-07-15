@@ -13,6 +13,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
@@ -51,8 +53,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.InsertManyOptions;
 
 /**
  * Engine for backing up and restoring a MongoDB database to/from tar.gz archives.
@@ -81,12 +85,30 @@ public class BackupEngine {
 	private static final String SUFFIX_TAR_GZ = ".tar.gz";
 	private static final String SUFFIX_PARTIAL = "_partial";
 	private static final String SUFFIX_JSON = ".json";
+	/** Matches the chunk suffix appended to secondary archive entries of a collection (e.g. {@code __000001}). */
+	private static final Pattern CHUNK_SUFFIX_PATTERN = Pattern.compile("__[0-9]+$");
+	/** Number of documents fetched per round-trip when iterating a collection cursor. */
+	private static final int CURSOR_BATCH_SIZE = 1000;
+
+	/** Default maximum size (in bytes) of a single collection chunk in the archive. */
+	public static final int DEFAULT_CHUNK_MAX_BYTES = 32 * 1024 * 1024;
+	/** Default maximum number of documents in a single collection chunk in the archive. */
+	public static final int DEFAULT_CHUNK_MAX_DOCUMENTS = 100_000;
+	/** Default maximum accumulated size (in bytes) of an insertMany batch at restore. */
+	public static final int DEFAULT_RESTORE_BATCH_MAX_BYTES = 32 * 1024 * 1024;
+	/** Default maximum number of documents in an insertMany batch at restore. */
+	public static final int DEFAULT_RESTORE_BATCH_MAX_DOCUMENTS = 10_000;
 
 	private final Path pathStore;
 	private final String baseName;
 	private final EngineBackupType type;
 	private final List<String> collectionNames = new ArrayList<>();
 	private boolean enableStoreOrRestoreData = true;
+	private int chunkMaxBytes = DEFAULT_CHUNK_MAX_BYTES;
+	private int chunkMaxDocuments = DEFAULT_CHUNK_MAX_DOCUMENTS;
+	private int restoreBatchMaxBytes = DEFAULT_RESTORE_BATCH_MAX_BYTES;
+	private int restoreBatchMaxDocuments = DEFAULT_RESTORE_BATCH_MAX_DOCUMENTS;
+	private boolean restoreRelaxedWriteConcern = true;
 
 	/**
 	 * Create a new backup engine.
@@ -108,6 +130,55 @@ public class BackupEngine {
 	 */
 	public void setEnableStoreOrRestoreData(boolean value) {
 		this.enableStoreOrRestoreData = value;
+	}
+
+	/**
+	 * Set the maximum size (in bytes) of a single collection chunk in the archive.
+	 * When a collection exceeds this size, it is split into multiple archive entries:
+	 * {@code <collection>.json}, {@code <collection>__000001.json}, {@code <collection>__000002.json}, ...
+	 * Bounding the chunk size bounds the backup memory usage whatever the collection size is.
+	 * @param value maximum chunk size in bytes (default {@link #DEFAULT_CHUNK_MAX_BYTES})
+	 */
+	public void setChunkMaxBytes(final int value) {
+		this.chunkMaxBytes = value;
+	}
+
+	/**
+	 * Set the maximum number of documents of a single collection chunk in the archive.
+	 * See {@link #setChunkMaxBytes(int)} — the first threshold reached triggers the chunk flush.
+	 * @param value maximum number of documents per chunk (default {@link #DEFAULT_CHUNK_MAX_DOCUMENTS})
+	 */
+	public void setChunkMaxDocuments(final int value) {
+		this.chunkMaxDocuments = value;
+	}
+
+	/**
+	 * Set the maximum accumulated size (in bytes) of a single insertMany batch at restore.
+	 * @param value maximum batch size in bytes (default {@link #DEFAULT_RESTORE_BATCH_MAX_BYTES})
+	 */
+	public void setRestoreBatchMaxBytes(final int value) {
+		this.restoreBatchMaxBytes = value;
+	}
+
+	/**
+	 * Set the maximum number of documents of a single insertMany batch at restore.
+	 * The first threshold reached (bytes or documents) triggers the insert.
+	 * @param value maximum number of documents per batch (default {@link #DEFAULT_RESTORE_BATCH_MAX_DOCUMENTS})
+	 */
+	public void setRestoreBatchMaxDocuments(final int value) {
+		this.restoreBatchMaxDocuments = value;
+	}
+
+	/**
+	 * Enable or disable the relaxed write concern during restore.
+	 * When enabled (default), documents are inserted with {@code w:1, journal:false} and unordered
+	 * bulk writes, which is significantly faster. Safe for a restore: the target collection must be
+	 * empty beforehand, so a failed restore is simply re-run from scratch.
+	 * @param value {@code true} to restore with relaxed write concern (default), {@code false} to
+	 *              use the connection default write concern and ordered inserts
+	 */
+	public void setRestoreRelaxedWriteConcern(final boolean value) {
+		this.restoreRelaxedWriteConcern = value;
 	}
 
 	/**
@@ -137,6 +208,8 @@ public class BackupEngine {
 			final GzipCompressorOutputStream gcos = new GzipCompressorOutputStream(fos);
 			final TarArchiveOutputStream taos = new TarArchiveOutputStream(gcos);
 			taos.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
+			// Allow entries bigger than 8GiB (media files) with POSIX extended headers
+			taos.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX);
 			return taos;
 		} catch (final IOException e) {
 			fos.close();
@@ -155,30 +228,41 @@ public class BackupEngine {
 		}
 	}
 
+	private JsonWriterSettings createJsonWriterSettings() {
+		return JsonWriterSettings.builder()//
+				.outputMode(this.type == EngineBackupType.JSON_EXTENDED ? JsonMode.EXTENDED : JsonMode.RELAXED) //
+				.build();
+	}
+
+	private String serializeDocument(final Document doc, final ObjectMapper mapper, final JsonWriterSettings settings)
+			throws IOException {
+		if (this.type == EngineBackupType.JSON_EXTERNAL) {
+			return mapper.writeValueAsString(doc);
+		}
+		return doc.toJson(settings);
+	}
+
+	/**
+	 * Serialize collections fully in memory. Only used by the snapshot API
+	 * ({@link #snapshot()} / {@link #snapshotAll()}): the whole content is materialized as byte
+	 * arrays, so it must not be used on large collections. The archive path streams chunk by chunk
+	 * instead (see {@link #backupCollectionToStream}).
+	 */
 	private Map<String, byte[]> serializeCollections(final MongoDatabase db, final List<String> names)
 			throws IOException {
 		final ObjectMapper mapper = ContextGenericTools.createObjectMapper();
-		final JsonWriterSettings settings = JsonWriterSettings.builder()//
-				.outputMode(this.type == EngineBackupType.JSON_EXTENDED ? JsonMode.EXTENDED : JsonMode.RELAXED) //
-				.build();
+		final JsonWriterSettings settings = createJsonWriterSettings();
 
 		// Use LinkedHashMap to preserve insertion order
 		final Map<String, byte[]> result = new LinkedHashMap<>();
 		for (final String collectionName : names) {
 			final ByteArrayOutputStream jsonOut = new ByteArrayOutputStream();
-
-			// TODO use a better way to stream the data ... here if the collection is too
-			// big, it will fail
 			final MongoCollection<Document> collection = db.getCollection(collectionName);
 			int count = 0;
-			try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(jsonOut))) {
-				for (final Document doc : collection.find()) {
+			try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(jsonOut, StandardCharsets.UTF_8))) {
+				for (final Document doc : collection.find().batchSize(CURSOR_BATCH_SIZE)) {
 					count++;
-					if (this.type == EngineBackupType.JSON_EXTERNAL) {
-						writer.write(mapper.writeValueAsString(doc));
-					} else {
-						writer.write(doc.toJson(settings));
-					}
+					writer.write(serializeDocument(doc, mapper, settings));
 					writer.newLine();
 				}
 				writer.flush();
@@ -194,17 +278,84 @@ public class BackupEngine {
 		return result;
 	}
 
+	private static String chunkEntryName(final String collectionName, final int chunkIndex) {
+		if (chunkIndex == 0) {
+			return collectionName + SUFFIX_JSON;
+		}
+		return collectionName + String.format("__%06d", chunkIndex) + SUFFIX_JSON;
+	}
+
+	/** Strip the chunk suffix ({@code __<digits>}) from an archive entry base name, if present. */
+	static String baseCollectionName(final String entryBaseName) {
+		return CHUNK_SUFFIX_PATTERN.matcher(entryBaseName).replaceFirst("");
+	}
+
+	private void writeChunkEntry(
+			final TarArchiveOutputStream tarOut,
+			final String collectionName,
+			final int chunkIndex,
+			final ByteArrayOutputStream chunkBuffer) throws IOException {
+		final String entryName = chunkEntryName(collectionName, chunkIndex);
+		final TarArchiveEntry tarEntry = new TarArchiveEntry(entryName);
+		tarEntry.setSize(chunkBuffer.size());
+		tarOut.putArchiveEntry(tarEntry);
+		chunkBuffer.writeTo(tarOut);
+		tarOut.closeArchiveEntry();
+		LOGGER.debug("Backup collection:  [CHUNK] {} {} Bytes", entryName, chunkBuffer.size());
+	}
+
+	/**
+	 * Stream one collection into the archive, chunk by chunk. Memory usage is bounded by the chunk
+	 * thresholds ({@link #setChunkMaxBytes(int)} / {@link #setChunkMaxDocuments(int)}) whatever the
+	 * collection size is. The first chunk keeps the historical entry name {@code <collection>.json}
+	 * so archives with collections below the thresholds are byte-compatible with the previous format.
+	 */
+	private void backupCollectionToStream(
+			final MongoDatabase db,
+			final String collectionName,
+			final TarArchiveOutputStream tarOut,
+			final ObjectMapper mapper,
+			final JsonWriterSettings settings) throws IOException {
+		final MongoCollection<Document> collection = db.getCollection(collectionName);
+		final ByteArrayOutputStream chunkBuffer = new ByteArrayOutputStream();
+		int chunkIndex = 0;
+		int chunkDocumentCount = 0;
+		long totalDocumentCount = 0;
+		long totalBytes = 0;
+		for (final Document doc : collection.find().batchSize(CURSOR_BATCH_SIZE)) {
+			chunkBuffer.write(serializeDocument(doc, mapper, settings).getBytes(StandardCharsets.UTF_8));
+			chunkBuffer.write('\n');
+			chunkDocumentCount++;
+			totalDocumentCount++;
+			if (chunkBuffer.size() >= this.chunkMaxBytes || chunkDocumentCount >= this.chunkMaxDocuments) {
+				totalBytes += chunkBuffer.size();
+				writeChunkEntry(tarOut, collectionName, chunkIndex, chunkBuffer);
+				chunkBuffer.reset();
+				chunkDocumentCount = 0;
+				chunkIndex++;
+			}
+		}
+		// Always write the first chunk (even empty, to keep the historical layout);
+		// write the last one only if it contains data.
+		if (chunkIndex == 0 || chunkBuffer.size() > 0) {
+			totalBytes += chunkBuffer.size();
+			writeChunkEntry(tarOut, collectionName, chunkIndex, chunkBuffer);
+			chunkIndex++;
+		}
+		final String colNameFormatted = String.format("%-25s", collectionName);
+		final String countFormatted = String.format("%5d", totalDocumentCount);
+		LOGGER.info("Backup collection:  [ END ] {} {} document(s), {} Bytes, {} chunk(s)", colNameFormatted,
+				countFormatted, totalBytes, chunkIndex);
+	}
+
 	private void backupCollectionListToStream(
 			final MongoDatabase db,
 			final List<String> names,
 			final TarArchiveOutputStream tarOut) throws IOException {
-		final Map<String, byte[]> serialized = serializeCollections(db, names);
-		for (final Map.Entry<String, byte[]> entry : serialized.entrySet()) {
-			final TarArchiveEntry tarEntry = new TarArchiveEntry(entry.getKey() + SUFFIX_JSON);
-			tarEntry.setSize(entry.getValue().length);
-			tarOut.putArchiveEntry(tarEntry);
-			tarOut.write(entry.getValue());
-			tarOut.closeArchiveEntry();
+		final ObjectMapper mapper = ContextGenericTools.createObjectMapper();
+		final JsonWriterSettings settings = createJsonWriterSettings();
+		for (final String collectionName : names) {
+			backupCollectionToStream(db, collectionName, tarOut, mapper, settings);
 		}
 	}
 
@@ -224,6 +375,46 @@ public class BackupEngine {
 		backupCollectionListToStream(db, filtered, tarOut);
 	}
 
+	private MongoCollection<Document> collectionForRestore(final MongoDatabase db, final String collectionName) {
+		final MongoCollection<Document> collection = db.getCollection(collectionName);
+		if (this.restoreRelaxedWriteConcern) {
+			return collection.withWriteConcern(WriteConcern.W1.withJournal(false));
+		}
+		return collection;
+	}
+
+	/**
+	 * Insert all NDJSON lines from the reader into the collection, by batches bounded both in
+	 * bytes and in number of documents. Inserts are unordered when the relaxed write concern is
+	 * enabled (the server can parallelize them).
+	 * @return the number of inserted documents
+	 */
+	private long insertDocumentsFromReader(final MongoCollection<Document> collection, final BufferedReader reader)
+			throws IOException {
+		final InsertManyOptions insertOptions = new InsertManyOptions().ordered(!this.restoreRelaxedWriteConcern);
+		final List<Document> buffer = new ArrayList<>();
+		long batchBytes = 0;
+		long count = 0;
+		String line;
+		while ((line = reader.readLine()) != null) {
+			if (line.isBlank()) {
+				continue;
+			}
+			buffer.add(Document.parse(line));
+			batchBytes += line.length();
+			count++;
+			if (buffer.size() >= this.restoreBatchMaxDocuments || batchBytes >= this.restoreBatchMaxBytes) {
+				collection.insertMany(buffer, insertOptions);
+				buffer.clear();
+				batchBytes = 0;
+			}
+		}
+		if (!buffer.isEmpty()) {
+			collection.insertMany(buffer, insertOptions);
+		}
+		return count;
+	}
+
 	private void restoreStreamToCollections(
 			final DBAccessMongo dbMongo,
 			final TarArchiveInputStream tarIn,
@@ -232,46 +423,45 @@ public class BackupEngine {
 		if (this.type == EngineBackupType.JSON_EXTERNAL) {
 			LOGGER.error("Try to retrieve data with generic JSON engine, you will lose real DB information");
 		}
+		// Cumulative document count per collection (a collection can be split in multiple chunks)
+		final Map<String, Long> restoredCounts = new LinkedHashMap<>();
 		TarArchiveEntry entry;
 		while ((entry = tarIn.getNextEntry()) != null) {
-			if (!entry.getName().endsWith(SUFFIX_JSON)) {
+			if (entry.isDirectory() || !entry.getName().endsWith(SUFFIX_JSON)) {
+				continue;
+			}
+			// Media files live under "data/"; collection entries are at the archive root
+			if (entry.getName().contains("/")) {
 				continue;
 			}
 
-			final String colName = entry.getName().replace(SUFFIX_JSON, "");
+			final String entryBaseName = entry.getName().substring(0, entry.getName().length() - SUFFIX_JSON.length());
+			final String colName = baseCollectionName(entryBaseName);
 			if (collectionName != null && !collectionName.equals(colName)) {
-				LOGGER.info("Skip collection: {} (filtered)", colName);
+				LOGGER.info("Skip collection: {} (filtered)", entryBaseName);
 				continue;
 			}
-			LOGGER.info("Restore collection: [START] {}", colName);
-			final MongoCollection<Document> collection = db.getCollection(colName);
-			try (var cursor = collection.find().limit(1).iterator()) {
-				if (cursor.hasNext()) {
-					throw new IOException(
-							"Collection: '" + colName + "' is not empty ==> can not insert object inside");
+			final MongoCollection<Document> collection = collectionForRestore(db, colName);
+			if (!restoredCounts.containsKey(colName)) {
+				// First chunk of this collection: check that the target is empty
+				LOGGER.info("Restore collection: [START] {}", colName);
+				try (var cursor = collection.find().limit(1).iterator()) {
+					if (cursor.hasNext()) {
+						throw new IOException(
+								"Collection: '" + colName + "' is not empty ==> can not insert object inside");
+					}
 				}
+				restoredCounts.put(colName, 0L);
 			}
-			final List<Document> buffer = new ArrayList<>();
-
-			final BufferedReader reader = new BufferedReader(new InputStreamReader(tarIn));
-			String line;
-			int count = 0;
-			while ((line = reader.readLine()) != null) {
-				count++;
-				buffer.add(Document.parse(line));
-				if (buffer.size() >= 1000) {
-					collection.insertMany(buffer);
-					buffer.clear();
-				}
-			}
-			if (!buffer.isEmpty()) {
-				collection.insertMany(buffer);
-			}
-			final String colNameFormatted = String.format("%-25s", colName);
-			final String countFormatted = String.format("%5d", count);
+			final BufferedReader reader = new BufferedReader(new InputStreamReader(tarIn, StandardCharsets.UTF_8));
+			final long count = insertDocumentsFromReader(collection, reader);
+			restoredCounts.merge(colName, count, Long::sum);
+		}
+		for (final Map.Entry<String, Long> restored : restoredCounts.entrySet()) {
+			final String colNameFormatted = String.format("%-25s", restored.getKey());
+			final String countFormatted = String.format("%5d", restored.getValue());
 			LOGGER.info("Restore collection: [ END ] {} {} document(s)", colNameFormatted, countFormatted);
 		}
-
 	}
 
 	private void restoreCollectionsFromMap(final DBAccessMongo dbMongo, final Map<String, byte[]> data)
@@ -283,24 +473,10 @@ public class BackupEngine {
 		for (final Map.Entry<String, byte[]> entry : data.entrySet()) {
 			final String colName = entry.getKey();
 			LOGGER.info("Restore collection: [START] {}", colName);
-			final MongoCollection<Document> collection = db.getCollection(colName);
-			final List<Document> buffer = new ArrayList<>();
-
+			final MongoCollection<Document> collection = collectionForRestore(db, colName);
 			try (BufferedReader reader = new BufferedReader(
-					new InputStreamReader(new ByteArrayInputStream(entry.getValue())))) {
-				String line;
-				int count = 0;
-				while ((line = reader.readLine()) != null) {
-					count++;
-					buffer.add(Document.parse(line));
-					if (buffer.size() >= 1000) {
-						collection.insertMany(buffer);
-						buffer.clear();
-					}
-				}
-				if (!buffer.isEmpty()) {
-					collection.insertMany(buffer);
-				}
+					new InputStreamReader(new ByteArrayInputStream(entry.getValue()), StandardCharsets.UTF_8))) {
+				final long count = insertDocumentsFromReader(collection, reader);
 				final String colNameFormatted = String.format("%-25s", colName);
 				final String countFormatted = String.format("%5d", count);
 				LOGGER.info("Restore collection: [ END ] {} {} document(s)", colNameFormatted, countFormatted);
@@ -631,6 +807,10 @@ public class BackupEngine {
 	/**
 	 * Capture an in-memory snapshot of registered collections (those added via {@link #addClass}/{@link #addCollection}).
 	 * The returned snapshot can later be restored with {@link #restore(BackupSnapshot)}.
+	 * <p>
+	 * <b>Warning:</b> the whole content of the collections is materialized in memory (test / small
+	 * dataset facility). For large databases, use the streamed archive API ({@link #store} /
+	 * {@link #storeAll}) instead.
 	 * @return an immutable snapshot of the registered collections
 	 * @throws IOException if serialization fails
 	 * @throws DataAccessException if the database connection fails
@@ -647,6 +827,10 @@ public class BackupEngine {
 	 * Capture an in-memory snapshot of all collections discovered in the database,
 	 * excluding {@code system.*} collections.
 	 * This method does not require prior {@link #addClass}/{@link #addCollection} calls.
+	 * <p>
+	 * <b>Warning:</b> the whole content of the collections is materialized in memory (test / small
+	 * dataset facility). For large databases, use the streamed archive API ({@link #store} /
+	 * {@link #storeAll}) instead.
 	 * @return an immutable snapshot of all user collections
 	 * @throws IOException if serialization fails
 	 * @throws DataAccessException if the database connection fails
