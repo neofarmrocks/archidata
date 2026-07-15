@@ -20,6 +20,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.WeekFields;
@@ -56,7 +58,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.InsertManyOptions;
+import com.mongodb.client.model.ReplaceOneModel;
+import com.mongodb.client.model.ReplaceOptions;
 
 /**
  * Engine for backing up and restoring a MongoDB database to/from tar.gz archives.
@@ -84,6 +89,7 @@ public class BackupEngine {
 
 	private static final String SUFFIX_TAR_GZ = ".tar.gz";
 	private static final String SUFFIX_PARTIAL = "_partial";
+	private static final String SUFFIX_DELTA = "_delta";
 	private static final String SUFFIX_JSON = ".json";
 	/** Matches the chunk suffix appended to secondary archive entries of a collection (e.g. {@code __000001}). */
 	private static final Pattern CHUNK_SUFFIX_PATTERN = Pattern.compile("__[0-9]+$");
@@ -278,6 +284,23 @@ public class BackupEngine {
 		return result;
 	}
 
+	/**
+	 * Build the MongoDB filter selecting the documents to include in a delta backup:
+	 * documents created or updated since the given date, plus documents carrying neither
+	 * {@code createdAt} nor {@code updatedAt} (they cannot be dated, so they are always
+	 * included — the delta restore upserts by {@code _id}, duplicates are impossible).
+	 * <p>
+	 * Limitation: a document without {@code updatedAt} that is modified in place is not
+	 * detected; deletions are never detected (a delta restore never removes documents).
+	 */
+	private static Document buildDeltaFilter(final Date since) {
+		return new Document("$or", List.of(//
+				new Document("updatedAt", new Document("$gte", since)), //
+				new Document("createdAt", new Document("$gte", since)), //
+				new Document("updatedAt", new Document("$exists", false)).append("createdAt",
+						new Document("$exists", false))));
+	}
+
 	private static String chunkEntryName(final String collectionName, final int chunkIndex) {
 		if (chunkIndex == 0) {
 			return collectionName + SUFFIX_JSON;
@@ -315,14 +338,16 @@ public class BackupEngine {
 			final String collectionName,
 			final TarArchiveOutputStream tarOut,
 			final ObjectMapper mapper,
-			final JsonWriterSettings settings) throws IOException {
+			final JsonWriterSettings settings,
+			final Document filter) throws IOException {
 		final MongoCollection<Document> collection = db.getCollection(collectionName);
 		final ByteArrayOutputStream chunkBuffer = new ByteArrayOutputStream();
 		int chunkIndex = 0;
 		int chunkDocumentCount = 0;
 		long totalDocumentCount = 0;
 		long totalBytes = 0;
-		for (final Document doc : collection.find().batchSize(CURSOR_BATCH_SIZE)) {
+		for (final Document doc : collection.find(filter != null ? filter : new Document())
+				.batchSize(CURSOR_BATCH_SIZE)) {
 			chunkBuffer.write(serializeDocument(doc, mapper, settings).getBytes(StandardCharsets.UTF_8));
 			chunkBuffer.write('\n');
 			chunkDocumentCount++;
@@ -351,28 +376,33 @@ public class BackupEngine {
 	private void backupCollectionListToStream(
 			final MongoDatabase db,
 			final List<String> names,
-			final TarArchiveOutputStream tarOut) throws IOException {
+			final TarArchiveOutputStream tarOut,
+			final Document filter) throws IOException {
 		final ObjectMapper mapper = ContextGenericTools.createObjectMapper();
 		final JsonWriterSettings settings = createJsonWriterSettings();
 		for (final String collectionName : names) {
-			backupCollectionToStream(db, collectionName, tarOut, mapper, settings);
+			backupCollectionToStream(db, collectionName, tarOut, mapper, settings, filter);
 		}
 	}
 
-	private void backupCollectionsToStream(final DBAccessMongo dbMongo, final TarArchiveOutputStream tarOut)
-			throws IOException {
+	private void backupCollectionsToStream(
+			final DBAccessMongo dbMongo,
+			final TarArchiveOutputStream tarOut,
+			final Document filter) throws IOException {
 		final MongoDatabase db = dbMongo.getInterface().getDatabase();
-		backupCollectionListToStream(db, this.collectionNames, tarOut);
+		backupCollectionListToStream(db, this.collectionNames, tarOut, filter);
 	}
 
-	private void backupAllCollectionsToStream(final DBAccessMongo dbMongo, final TarArchiveOutputStream tarOut)
-			throws IOException {
+	private void backupAllCollectionsToStream(
+			final DBAccessMongo dbMongo,
+			final TarArchiveOutputStream tarOut,
+			final Document filter) throws IOException {
 		final MongoDatabase db = dbMongo.getInterface().getDatabase();
 		final List<String> allNames = db.listCollectionNames().into(new ArrayList<>());
 		// Filter out system collections
 		final List<String> filtered = allNames.stream().filter(name -> !name.startsWith("system.")).sorted().toList();
 		LOGGER.info("Discovered {} collections for backup (filtered from {} total)", filtered.size(), allNames.size());
-		backupCollectionListToStream(db, filtered, tarOut);
+		backupCollectionListToStream(db, filtered, tarOut, filter);
 	}
 
 	private MongoCollection<Document> collectionForRestore(final MongoDatabase db, final String collectionName) {
@@ -415,10 +445,45 @@ public class BackupEngine {
 		return count;
 	}
 
+	/**
+	 * Upsert all NDJSON lines from the reader into the collection (delta restore): each document
+	 * replaces the existing one with the same {@code _id}, or is inserted when absent. Batches are
+	 * bounded like {@link #insertDocumentsFromReader}.
+	 * @return the number of upserted documents
+	 */
+	private long upsertDocumentsFromReader(final MongoCollection<Document> collection, final BufferedReader reader)
+			throws IOException {
+		final BulkWriteOptions bulkOptions = new BulkWriteOptions().ordered(!this.restoreRelaxedWriteConcern);
+		final ReplaceOptions replaceOptions = new ReplaceOptions().upsert(true);
+		final List<ReplaceOneModel<Document>> buffer = new ArrayList<>();
+		long batchBytes = 0;
+		long count = 0;
+		String line;
+		while ((line = reader.readLine()) != null) {
+			if (line.isBlank()) {
+				continue;
+			}
+			final Document doc = Document.parse(line);
+			buffer.add(new ReplaceOneModel<>(new Document("_id", doc.get("_id")), doc, replaceOptions));
+			batchBytes += line.length();
+			count++;
+			if (buffer.size() >= this.restoreBatchMaxDocuments || batchBytes >= this.restoreBatchMaxBytes) {
+				collection.bulkWrite(buffer, bulkOptions);
+				buffer.clear();
+				batchBytes = 0;
+			}
+		}
+		if (!buffer.isEmpty()) {
+			collection.bulkWrite(buffer, bulkOptions);
+		}
+		return count;
+	}
+
 	private void restoreStreamToCollections(
 			final DBAccessMongo dbMongo,
 			final TarArchiveInputStream tarIn,
-			final String collectionName) throws IOException {
+			final String collectionName,
+			final boolean upsertMode) throws IOException {
 		final MongoDatabase db = dbMongo.getInterface().getDatabase();
 		if (this.type == EngineBackupType.JSON_EXTERNAL) {
 			LOGGER.error("Try to retrieve data with generic JSON engine, you will lose real DB information");
@@ -443,18 +508,22 @@ public class BackupEngine {
 			}
 			final MongoCollection<Document> collection = collectionForRestore(db, colName);
 			if (!restoredCounts.containsKey(colName)) {
-				// First chunk of this collection: check that the target is empty
 				LOGGER.info("Restore collection: [START] {}", colName);
-				try (var cursor = collection.find().limit(1).iterator()) {
-					if (cursor.hasNext()) {
-						throw new IOException(
-								"Collection: '" + colName + "' is not empty ==> can not insert object inside");
+				// First chunk of this collection: check that the target is empty.
+				// A delta restore upserts on top of existing data, so no check in that mode.
+				if (!upsertMode) {
+					try (var cursor = collection.find().limit(1).iterator()) {
+						if (cursor.hasNext()) {
+							throw new IOException(
+									"Collection: '" + colName + "' is not empty ==> can not insert object inside");
+						}
 					}
 				}
 				restoredCounts.put(colName, 0L);
 			}
 			final BufferedReader reader = new BufferedReader(new InputStreamReader(tarIn, StandardCharsets.UTF_8));
-			final long count = insertDocumentsFromReader(collection, reader);
+			final long count = upsertMode ? upsertDocumentsFromReader(collection, reader)
+					: insertDocumentsFromReader(collection, reader);
 			restoredCounts.merge(colName, count, Long::sum);
 		}
 		for (final Map.Entry<String, Long> restored : restoredCounts.entrySet()) {
@@ -484,43 +553,49 @@ public class BackupEngine {
 		}
 	}
 
-	private void backupCollectionsToStream(final TarArchiveOutputStream tarOut)
+	private void backupCollectionsToStream(final TarArchiveOutputStream tarOut, final Document filter)
 			throws IOException, DataAccessException {
 		try (DataAccessConnectionContext ctx = new DataAccessConnectionContext()) {
 			final DBAccessMongo dbMongo = ctx.get();
-			backupCollectionsToStream(dbMongo, tarOut);
+			backupCollectionsToStream(dbMongo, tarOut, filter);
 		}
 	}
 
-	private void backupAllCollectionsToStream(final TarArchiveOutputStream tarOut)
+	private void backupAllCollectionsToStream(final TarArchiveOutputStream tarOut, final Document filter)
 			throws IOException, DataAccessException {
 		try (DataAccessConnectionContext ctx = new DataAccessConnectionContext()) {
 			final DBAccessMongo dbMongo = ctx.get();
-			backupAllCollectionsToStream(dbMongo, tarOut);
+			backupAllCollectionsToStream(dbMongo, tarOut, filter);
 		}
 	}
 
-	private void restoreStreamToCollections(final TarArchiveInputStream tarIn, final String collectionName)
-			throws IOException, DataAccessException {
+	private void restoreStreamToCollections(
+			final TarArchiveInputStream tarIn,
+			final String collectionName,
+			final boolean upsertMode) throws IOException, DataAccessException {
 		try (DataAccessConnectionContext ctx = new DataAccessConnectionContext()) {
 			final DBAccessMongo dbMongo = ctx.get();
-			restoreStreamToCollections(dbMongo, tarIn, collectionName);
+			restoreStreamToCollections(dbMongo, tarIn, collectionName, upsertMode);
 		}
 	}
 
-	private void backupDataToStream(final TarArchiveOutputStream tarOut) throws IOException, DataAccessException {
+	private void backupDataToStream(final TarArchiveOutputStream tarOut, final Date modifiedSince)
+			throws IOException, DataAccessException {
 		final String mediaFolder = ConfigBaseVariable.getMediaDataFolder();
 		// Create a File to the specific data of medias:
 		final File mediaDirFile = new File(mediaFolder);
 
 		if (mediaDirFile.exists() && mediaDirFile.isDirectory() && mediaDirFile.canRead()) {
 			// recursive add files in the tar:
-			addDirectoryToTar(tarOut, mediaDirFile, "data/");
+			addDirectoryToTar(tarOut, mediaDirFile, "data/", modifiedSince);
 		}
 	}
 
-	private void addDirectoryToTar(final TarArchiveOutputStream tarOut, final File sourceDir, final String basePath)
-			throws IOException {
+	private void addDirectoryToTar(
+			final TarArchiveOutputStream tarOut,
+			final File sourceDir,
+			final String basePath,
+			final Date modifiedSince) throws IOException {
 		if (!sourceDir.canRead()) {
 			LOGGER.warn("The folder is not readable ==> ignored: {}", sourceDir.getAbsolutePath());
 			return;
@@ -544,10 +619,14 @@ public class BackupEngine {
 						tarOut.putArchiveEntry(dirEntry);
 						tarOut.closeArchiveEntry();
 
-						addDirectoryToTar(tarOut, file, entryName + "/");
+						addDirectoryToTar(tarOut, file, entryName + "/", modifiedSince);
 					} else {
 						if (!file.exists()) {
 							LOGGER.warn("Invalid file, ignored: {}", file.getAbsolutePath());
+							continue;
+						}
+						// Delta backup: only include files modified since the reference date
+						if (modifiedSince != null && file.lastModified() < modifiedSince.getTime()) {
 							continue;
 						}
 
@@ -705,8 +784,10 @@ public class BackupEngine {
 		void backup(TarArchiveOutputStream tarOut) throws IOException, DataAccessException;
 	}
 
-	private Date executeStoreInternal(final String sequence, final BackupCollectionStrategy strategy)
-			throws IOException, DataAccessException {
+	private Date executeStoreInternal(
+			final String sequence,
+			final BackupCollectionStrategy strategy,
+			final Date mediaModifiedSince) throws IOException, DataAccessException {
 		final Date now = Date.from(Instant.now());
 		final String fileName = this.baseName + (sequence != null ? "_" + sequence : "") + SUFFIX_TAR_GZ;
 		// Ensure the store directory exists
@@ -717,7 +798,7 @@ public class BackupEngine {
 		try (TarArchiveOutputStream tarOut = openTarGzOutputStream(outputFileTmp)) {
 			strategy.backup(tarOut);
 			if (this.enableStoreOrRestoreData) {
-				backupDataToStream(tarOut);
+				backupDataToStream(tarOut, mediaModifiedSince);
 			}
 		}
 		final Path outputFileFinal = this.pathStore.resolve(fileName);
@@ -743,7 +824,28 @@ public class BackupEngine {
 	 * @throws DataAccessException if the database connection fails
 	 */
 	public Date store(final String sequence) throws IOException, DataAccessException {
-		return executeStoreInternal(sequence, this::backupCollectionsToStream);
+		return executeStoreInternal(sequence, tarOut -> backupCollectionsToStream(tarOut, null), null);
+	}
+
+	/**
+	 * Backup only the documents of the registered collections that changed since the given date
+	 * (delta backup). A document is included when its {@code updatedAt} or {@code createdAt} is
+	 * after {@code since}; documents carrying neither field are always included. Media files are
+	 * filtered on their modification time. The archive layout is identical to a full backup and
+	 * must be restored with {@link #restoreDeltaFile} on top of the full backup it is based on.
+	 * <p>
+	 * By convention the sequence should end with {@code "_delta"} (e.g.
+	 * {@code "2025-06-20_10:15:00.000_delta"}) so that retention and
+	 * {@link #getLastFullBackupDate()} can tell delta archives apart from full ones.
+	 * @param sequence the sequence identifier appended to the backup filename
+	 * @param since only documents/files modified at or after this date are included
+	 * @return the date at which the backup started
+	 * @throws IOException if the archive cannot be written
+	 * @throws DataAccessException if the database connection fails
+	 */
+	public Date storeDelta(final String sequence, final Date since) throws IOException, DataAccessException {
+		final Document filter = buildDeltaFilter(since);
+		return executeStoreInternal(sequence, tarOut -> backupCollectionsToStream(tarOut, filter), since);
 	}
 
 	/**
@@ -755,7 +857,22 @@ public class BackupEngine {
 	 * @throws DataAccessException if the database connection fails
 	 */
 	public Date storeAll(final String sequence) throws IOException, DataAccessException {
-		return executeStoreInternal(sequence, this::backupAllCollectionsToStream);
+		return executeStoreInternal(sequence, tarOut -> backupAllCollectionsToStream(tarOut, null), null);
+	}
+
+	/**
+	 * Delta variant of {@link #storeAll(String)}: backup the documents of all discovered
+	 * collections (excluding {@code system.*}) that changed since the given date.
+	 * See {@link #storeDelta(String, Date)} for the selection rules and naming convention.
+	 * @param sequence the sequence identifier appended to the backup filename
+	 * @param since only documents/files modified at or after this date are included
+	 * @return the date at which the backup started
+	 * @throws IOException if the archive cannot be written
+	 * @throws DataAccessException if the database connection fails
+	 */
+	public Date storeAllDelta(final String sequence, final Date since) throws IOException, DataAccessException {
+		final Document filter = buildDeltaFilter(since);
+		return executeStoreInternal(sequence, tarOut -> backupAllCollectionsToStream(tarOut, filter), since);
 	}
 
 	/**
@@ -780,7 +897,7 @@ public class BackupEngine {
 			return false;
 		}
 		try (TarArchiveInputStream tarIn = openTarGzInputStream(restoreFileName)) {
-			restoreStreamToCollections(tarIn, collectionName);
+			restoreStreamToCollections(tarIn, collectionName, false);
 		}
 		// Need to open the stream 2 time due to the fact it is not possible to reset marker position.
 		if (this.enableStoreOrRestoreData) {
@@ -790,6 +907,28 @@ public class BackupEngine {
 		}
 		LOGGER.info("Restore DB: [ END ]");
 		return true;
+	}
+
+	/**
+	 * Apply a delta archive on top of the current database state (typically right after restoring
+	 * the full backup the delta is based on). Documents are upserted by {@code _id}: existing
+	 * documents are replaced, missing ones are inserted, and nothing is ever deleted. Media files
+	 * present in the delta are extracted over the existing ones (previous data is NOT moved away).
+	 * @param deltaFileName path to the delta tar.gz archive to apply
+	 * @throws IOException if the archive cannot be read
+	 * @throws DataAccessException if the database connection fails
+	 */
+	public void restoreDeltaFile(final Path deltaFileName) throws IOException, DataAccessException {
+		LOGGER.info("Restore delta: [START] BD: '{}' from file: '{}'", this.baseName, deltaFileName);
+		try (TarArchiveInputStream tarIn = openTarGzInputStream(deltaFileName)) {
+			restoreStreamToCollections(tarIn, null, true);
+		}
+		if (this.enableStoreOrRestoreData) {
+			try (TarArchiveInputStream tarIn = openTarGzInputStream(deltaFileName)) {
+				restoreStreamToData(tarIn, false);
+			}
+		}
+		LOGGER.info("Restore delta: [ END ]");
 	}
 
 	/**
@@ -886,15 +1025,7 @@ public class BackupEngine {
 		if (sequence == null || sequence.isEmpty()) {
 			return null;
 		}
-		// Strip known trailing suffixes like "_full", "_partial", "_incremental"
-		String cleaned = sequence;
-		final int lastUnderscore = cleaned.lastIndexOf('_');
-		if (lastUnderscore > 0) {
-			final String suffix = cleaned.substring(lastUnderscore + 1);
-			if (!suffix.isEmpty() && suffix.chars().allMatch(Character::isLetter)) {
-				cleaned = cleaned.substring(0, lastUnderscore);
-			}
-		}
+		final String cleaned = stripSequenceSuffix(sequence);
 		for (final DateTimeFormatter formatter : SEQUENCE_DATE_FORMATTERS) {
 			try {
 				return LocalDate.parse(cleaned, formatter);
@@ -913,6 +1044,40 @@ public class BackupEngine {
 			}
 		}
 		return null;
+	}
+
+	/** Strip a known trailing letter suffix like {@code "_full"}, {@code "_partial"} or {@code "_delta"}. */
+	private static String stripSequenceSuffix(final String sequence) {
+		final int lastUnderscore = sequence.lastIndexOf('_');
+		if (lastUnderscore > 0) {
+			final String suffix = sequence.substring(lastUnderscore + 1);
+			if (!suffix.isEmpty() && suffix.chars().allMatch(Character::isLetter)) {
+				return sequence.substring(0, lastUnderscore);
+			}
+		}
+		return sequence;
+	}
+
+	/**
+	 * Parse a date and time from a backup sequence string (same formats and suffix handling as
+	 * {@link #parseDateFromSequence}). A sequence carrying only a date resolves to midnight.
+	 * @param sequence the sequence string to parse
+	 * @return the parsed LocalDateTime, or null if unparseable
+	 */
+	public static LocalDateTime parseDateTimeFromSequence(final String sequence) {
+		if (sequence == null || sequence.isEmpty()) {
+			return null;
+		}
+		final String cleaned = stripSequenceSuffix(sequence);
+		for (final DateTimeFormatter formatter : SEQUENCE_DATE_FORMATTERS) {
+			try {
+				return LocalDateTime.parse(cleaned, formatter);
+			} catch (final DateTimeParseException e) {
+				// try next format (date-only patterns cannot produce a LocalDateTime)
+			}
+		}
+		final LocalDate dateOnly = parseDateFromSequence(sequence);
+		return dateOnly != null ? dateOnly.atStartOfDay() : null;
 	}
 
 	/**
@@ -940,16 +1105,94 @@ public class BackupEngine {
 				if (partial) {
 					middle = middle.substring(0, middle.length() - SUFFIX_PARTIAL.length());
 				}
+				final boolean delta = middle.endsWith(SUFFIX_DELTA);
 				final LocalDate date = parseDateFromSequence(middle);
 				if (date == null) {
 					LOGGER.warn("Backup file with unparseable date in sequence, ignored for retention: {}", fileName);
 					continue;
 				}
-				result.add(new BackupFileInfo(filePath, middle, date, partial));
+				result.add(new BackupFileInfo(filePath, middle, date, partial, delta));
 			}
 		}
 		Collections.sort(result);
 		return result;
+	}
+
+	private static BackupFileInfo findLatestFull(final List<BackupFileInfo> files) {
+		BackupFileInfo best = null;
+		for (final BackupFileInfo file : files) {
+			if (!file.delta() && (best == null || file.compareTo(best) > 0)) {
+				best = file;
+			}
+		}
+		return best;
+	}
+
+	/**
+	 * Return the start date of the most recent full (non-delta) backup file, parsed from its
+	 * filename sequence. Sequences are interpreted as UTC timestamps — callers generating
+	 * sequences (e.g. for {@link #store}) should format them in UTC for this to be exact.
+	 * Typically used to compute the {@code since} parameter of {@link #storeDelta}/{@link #storeAllDelta}.
+	 * @return the date of the latest full backup, or {@code null} when no full backup exists
+	 * @throws IOException if listing the backup files fails
+	 */
+	public Date getLastFullBackupDate() throws IOException {
+		final BackupFileInfo latestFull = findLatestFull(listBackupFiles());
+		if (latestFull == null) {
+			return null;
+		}
+		final LocalDateTime dateTime = parseDateTimeFromSequence(latestFull.sequence());
+		if (dateTime == null) {
+			return null;
+		}
+		return Date.from(dateTime.toInstant(ZoneOffset.UTC));
+	}
+
+	/**
+	 * Resolve the ordered list of archives needed to restore the latest known state: the most
+	 * recent full backup, followed by the most recent delta based on it (if any).
+	 * @return the archive paths to restore in order, or an empty list when no full backup exists
+	 * @throws IOException if listing the backup files fails
+	 */
+	public List<Path> getLatestRestoreChain() throws IOException {
+		final List<BackupFileInfo> files = listBackupFiles();
+		final BackupFileInfo latestFull = findLatestFull(files);
+		if (latestFull == null) {
+			return List.of();
+		}
+		BackupFileInfo latestDelta = null;
+		for (final BackupFileInfo file : files) {
+			if (file.delta() && file.compareTo(latestFull) > 0
+					&& (latestDelta == null || file.compareTo(latestDelta) > 0)) {
+				latestDelta = file;
+			}
+		}
+		if (latestDelta == null) {
+			return List.of(latestFull.path());
+		}
+		return List.of(latestFull.path(), latestDelta.path());
+	}
+
+	/**
+	 * Restore the latest known state: restore the most recent full backup (the target database
+	 * must be empty) then apply the most recent delta based on it, if any.
+	 * @return {@code true} if a full backup was found and restored
+	 * @throws IOException if an archive cannot be read
+	 * @throws DataAccessException if the database connection fails
+	 */
+	public boolean restoreLatest() throws IOException, DataAccessException {
+		final List<Path> chain = getLatestRestoreChain();
+		if (chain.isEmpty()) {
+			LOGGER.error("No full backup found in: {}", this.pathStore);
+			return false;
+		}
+		if (!restoreFile(chain.get(0), null)) {
+			return false;
+		}
+		for (int i = 1; i < chain.size(); i++) {
+			restoreDeltaFile(chain.get(i));
+		}
+		return true;
 	}
 
 	/**
@@ -970,6 +1213,12 @@ public class BackupEngine {
 
 		final List<BackupFileInfo> toDelete = new ArrayList<>();
 
+		// Delta backups are cumulative since the full they are based on: any newer full
+		// supersedes them. Keep only the deltas newer than the latest full (they are the ones
+		// still needed to roll forward); delete all the others. Deltas never enter the zone
+		// deduplication below — only full backups are retained long-term.
+		final BackupFileInfo latestFull = findLatestFull(files);
+
 		// Group files by zone, then apply deduplication per group
 		// Zone 1: date >= keepAllLimit (recent) → keep all
 		// Zone 2: date >= keepDailyLimit && date < keepAllLimit → keep 1 per day
@@ -985,6 +1234,12 @@ public class BackupEngine {
 		final List<BackupFileInfo> weeklyAll = new ArrayList<>();
 
 		for (final BackupFileInfo file : files) {
+			if (file.delta()) {
+				if (latestFull != null && file.compareTo(latestFull) < 0) {
+					toDelete.add(file);
+				}
+				continue;
+			}
 			final LocalDate fileDate = file.date();
 			if (!fileDate.isBefore(keepAllLimit)) {
 				// Zone 1: keep all
