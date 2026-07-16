@@ -1,24 +1,16 @@
 package test.atriasoft.archidata.backup;
 
-import java.io.BufferedInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
 
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
-import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
 import org.atriasoft.archidata.backup.BackupEngine;
 import org.atriasoft.archidata.backup.BackupEngine.EngineBackupType;
 import org.atriasoft.archidata.backup.RetentionPolicy;
@@ -64,47 +56,7 @@ public class TestBackupDelta {
 
 	@AfterEach
 	public void tearDownBackupDir() throws IOException {
-		deleteRecursive(this.tempBackupDir);
-	}
-
-	private void deleteRecursive(final Path dir) throws IOException {
-		if (dir != null && Files.exists(dir)) {
-			try (var stream = Files.walk(dir)) {
-				stream.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
-					try {
-						Files.deleteIfExists(p);
-					} catch (final IOException e) {
-						// ignore cleanup errors
-					}
-				});
-			}
-		}
-	}
-
-	private Map<String, String> extractTarGzToMap(final Path inputPath) throws IOException {
-		final Map<String, String> result = new HashMap<>();
-		try (InputStream fileIn = Files.newInputStream(inputPath);
-				BufferedInputStream bufferedIn = new BufferedInputStream(fileIn);
-				GzipCompressorInputStream gzipIn = new GzipCompressorInputStream(bufferedIn);
-				TarArchiveInputStream tarIn = new TarArchiveInputStream(gzipIn)) {
-			TarArchiveEntry entry;
-			while ((entry = tarIn.getNextEntry()) != null) {
-				if (entry.isDirectory()) {
-					continue;
-				}
-				final ByteArrayOutputStream out = new ByteArrayOutputStream();
-				tarIn.transferTo(out);
-				result.put(entry.getName(), out.toString(StandardCharsets.UTF_8));
-			}
-		}
-		return result;
-	}
-
-	private int countLines(final String content) {
-		if (content == null || content.isEmpty()) {
-			return 0;
-		}
-		return (int) content.lines().filter(line -> !line.isBlank()).count();
+		BackupTestTools.deleteRecursive(this.tempBackupDir);
 	}
 
 	private BackupEngine createEngine(final String baseName) {
@@ -137,9 +89,7 @@ public class TestBackupDelta {
 		insertWithoutUpdate("before full");
 		Thread.sleep(20);
 
-		final BackupEngine engine = new BackupEngine(this.tempBackupDir, "deltacontent",
-				EngineBackupType.JSON_EXTENDED);
-		engine.setEnableStoreOrRestoreData(false);
+		final BackupEngine engine = createEngine("deltacontent");
 		final Date fullDate = engine.storeAll("2026-01-01_00:00:00.000_full");
 		Thread.sleep(20);
 
@@ -151,12 +101,12 @@ public class TestBackupDelta {
 
 		engine.storeAllDelta("2026-01-01_00:15:00.000_delta", fullDate);
 
-		final Map<String, String> deltaContent = extractTarGzToMap(
-				this.tempBackupDir.resolve("deltacontent_2026-01-01_00:15:00.000_delta.tar.gz"));
+		final Map<String, String> deltaContent = BackupTestTools
+				.extractTarGzToMap(this.tempBackupDir.resolve("deltacontent_2026-01-01_00:15:00.000_delta.tar.gz"));
 		// Dated collection: only the updated and the created documents
-		Assertions.assertEquals(2, countLines(deltaContent.get("DataStoreWithUpdate.json")));
+		Assertions.assertEquals(2, BackupTestTools.countLines(deltaContent.get("DataStoreWithUpdate.json")));
 		// Undated collection: no way to date the documents, all of them are included (safe fallback)
-		Assertions.assertEquals(2, countLines(deltaContent.get("DataStoreWithoutUpdate.json")));
+		Assertions.assertEquals(2, BackupTestTools.countLines(deltaContent.get("DataStoreWithoutUpdate.json")));
 	}
 
 	@Test
@@ -212,10 +162,10 @@ public class TestBackupDelta {
 		engine.storeAllDelta("2026-01-01_00:15:00.000_delta", new Date(0));
 
 		final Path archivePath = this.tempBackupDir.resolve("deltachunk_2026-01-01_00:15:00.000_delta.tar.gz");
-		final Map<String, String> deltaContent = extractTarGzToMap(archivePath);
-		Assertions.assertEquals(1, countLines(deltaContent.get("DataStoreWithUpdate.json")));
-		Assertions.assertEquals(1, countLines(deltaContent.get("DataStoreWithUpdate__000001.json")));
-		Assertions.assertEquals(1, countLines(deltaContent.get("DataStoreWithUpdate__000002.json")));
+		final Map<String, String> deltaContent = BackupTestTools.extractTarGzToMap(archivePath);
+		Assertions.assertEquals(1, BackupTestTools.countLines(deltaContent.get("DataStoreWithUpdate.json")));
+		Assertions.assertEquals(1, BackupTestTools.countLines(deltaContent.get("DataStoreWithUpdate__000001.json")));
+		Assertions.assertEquals(1, BackupTestTools.countLines(deltaContent.get("DataStoreWithUpdate__000002.json")));
 
 		// Upsert restore merges the chunks (and works on an empty collection)
 		DataAccess.drop(DataStoreWithUpdate.class);
@@ -241,8 +191,8 @@ public class TestBackupDelta {
 					EngineBackupType.JSON_EXTENDED);
 			engine.storeAllDelta("2026-01-01_00:15:00.000_delta", since);
 
-			final Map<String, String> deltaContent = extractTarGzToMap(
-					this.tempBackupDir.resolve("deltamedia_2026-01-01_00:15:00.000_delta.tar.gz"));
+			final Map<String, String> deltaContent = BackupTestTools
+					.extractTarGzToMap(this.tempBackupDir.resolve("deltamedia_2026-01-01_00:15:00.000_delta.tar.gz"));
 			Assertions.assertTrue(deltaContent.containsKey("data/new-file.txt"));
 			Assertions.assertFalse(deltaContent.containsKey("data/old-file.txt"));
 
@@ -254,7 +204,7 @@ public class TestBackupDelta {
 			Assertions.assertFalse(Files.exists(tempMediaDir.resolve("history_restore")));
 		} finally {
 			ConfigBaseVariable.setDataFolder(null);
-			deleteRecursive(tempMediaDir);
+			BackupTestTools.deleteRecursive(tempMediaDir);
 		}
 	}
 
@@ -305,6 +255,31 @@ public class TestBackupDelta {
 		Assertions.assertEquals(2, chain.size());
 		Assertions.assertEquals(fileNames.get(2), chain.get(0).getFileName().toString());
 		Assertions.assertEquals(fileNames.get(4), chain.get(1).getFileName().toString());
+	}
+
+	@Test
+	public void testPartialArchiveIsNotARestoreBase() throws Exception {
+		final String base = "partialbase";
+		final List<String> fileNames = List.of(//
+				base + "_2026-01-01_00:00:00.000_full.tar.gz", //
+				base + "_2026-01-01_06:00:00.000_partial.tar.gz", //
+				base + "_2026-01-01_06:15:00.000_delta.tar.gz");
+		for (final String fileName : fileNames) {
+			Files.createFile(this.tempBackupDir.resolve(fileName));
+		}
+		final BackupEngine engine = createEngine(base);
+
+		// A partial archive (subset of collections) newer than the last full must not become
+		// the delta/restore base
+		final Date lastFull = engine.getLastFullBackupDate();
+		Assertions.assertNotNull(lastFull);
+		Assertions.assertEquals(Date.from(LocalDateTime.of(2026, 1, 1, 0, 0, 0).toInstant(ZoneOffset.UTC)).getTime(),
+				lastFull.getTime());
+
+		final List<Path> chain = engine.getLatestRestoreChain();
+		Assertions.assertEquals(2, chain.size());
+		Assertions.assertEquals(fileNames.get(0), chain.get(0).getFileName().toString());
+		Assertions.assertEquals(fileNames.get(2), chain.get(1).getFileName().toString());
 	}
 
 	@Test

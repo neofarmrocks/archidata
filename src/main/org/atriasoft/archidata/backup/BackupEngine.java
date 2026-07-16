@@ -59,9 +59,10 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.BulkWriteOptions;
-import com.mongodb.client.model.InsertManyOptions;
+import com.mongodb.client.model.InsertOneModel;
 import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.WriteModel;
 
 /**
  * Engine for backing up and restoring a MongoDB database to/from tar.gz archives.
@@ -414,48 +415,20 @@ public class BackupEngine {
 	}
 
 	/**
-	 * Insert all NDJSON lines from the reader into the collection, by batches bounded both in
-	 * bytes and in number of documents. Inserts are unordered when the relaxed write concern is
-	 * enabled (the server can parallelize them).
-	 * @return the number of inserted documents
+	 * Write all NDJSON lines from the reader into the collection, by batches bounded both in
+	 * bytes and in number of documents. In insert mode (full restore) each document is inserted;
+	 * in upsert mode (delta restore) each document replaces the existing one with the same
+	 * {@code _id}, or is inserted when absent. Writes are unordered when the relaxed write
+	 * concern is enabled (the server can parallelize them).
+	 * @return the number of written documents
 	 */
-	private long insertDocumentsFromReader(final MongoCollection<Document> collection, final BufferedReader reader)
-			throws IOException {
-		final InsertManyOptions insertOptions = new InsertManyOptions().ordered(!this.restoreRelaxedWriteConcern);
-		final List<Document> buffer = new ArrayList<>();
-		long batchBytes = 0;
-		long count = 0;
-		String line;
-		while ((line = reader.readLine()) != null) {
-			if (line.isBlank()) {
-				continue;
-			}
-			buffer.add(Document.parse(line));
-			batchBytes += line.length();
-			count++;
-			if (buffer.size() >= this.restoreBatchMaxDocuments || batchBytes >= this.restoreBatchMaxBytes) {
-				collection.insertMany(buffer, insertOptions);
-				buffer.clear();
-				batchBytes = 0;
-			}
-		}
-		if (!buffer.isEmpty()) {
-			collection.insertMany(buffer, insertOptions);
-		}
-		return count;
-	}
-
-	/**
-	 * Upsert all NDJSON lines from the reader into the collection (delta restore): each document
-	 * replaces the existing one with the same {@code _id}, or is inserted when absent. Batches are
-	 * bounded like {@link #insertDocumentsFromReader}.
-	 * @return the number of upserted documents
-	 */
-	private long upsertDocumentsFromReader(final MongoCollection<Document> collection, final BufferedReader reader)
-			throws IOException {
+	private long writeDocumentsFromReader(
+			final MongoCollection<Document> collection,
+			final BufferedReader reader,
+			final boolean upsertMode) throws IOException {
 		final BulkWriteOptions bulkOptions = new BulkWriteOptions().ordered(!this.restoreRelaxedWriteConcern);
 		final ReplaceOptions replaceOptions = new ReplaceOptions().upsert(true);
-		final List<ReplaceOneModel<Document>> buffer = new ArrayList<>();
+		final List<WriteModel<Document>> buffer = new ArrayList<>();
 		long batchBytes = 0;
 		long count = 0;
 		String line;
@@ -464,7 +437,8 @@ public class BackupEngine {
 				continue;
 			}
 			final Document doc = Document.parse(line);
-			buffer.add(new ReplaceOneModel<>(new Document("_id", doc.get("_id")), doc, replaceOptions));
+			buffer.add(upsertMode ? new ReplaceOneModel<>(new Document("_id", doc.get("_id")), doc, replaceOptions)
+					: new InsertOneModel<>(doc));
 			batchBytes += line.length();
 			count++;
 			if (buffer.size() >= this.restoreBatchMaxDocuments || batchBytes >= this.restoreBatchMaxBytes) {
@@ -522,8 +496,7 @@ public class BackupEngine {
 				restoredCounts.put(colName, 0L);
 			}
 			final BufferedReader reader = new BufferedReader(new InputStreamReader(tarIn, StandardCharsets.UTF_8));
-			final long count = upsertMode ? upsertDocumentsFromReader(collection, reader)
-					: insertDocumentsFromReader(collection, reader);
+			final long count = writeDocumentsFromReader(collection, reader, upsertMode);
 			restoredCounts.merge(colName, count, Long::sum);
 		}
 		for (final Map.Entry<String, Long> restored : restoredCounts.entrySet()) {
@@ -545,7 +518,7 @@ public class BackupEngine {
 			final MongoCollection<Document> collection = collectionForRestore(db, colName);
 			try (BufferedReader reader = new BufferedReader(
 					new InputStreamReader(new ByteArrayInputStream(entry.getValue()), StandardCharsets.UTF_8))) {
-				final long count = insertDocumentsFromReader(collection, reader);
+				final long count = writeDocumentsFromReader(collection, reader, false);
 				final String colNameFormatted = String.format("%-25s", colName);
 				final String countFormatted = String.format("%5d", count);
 				LOGGER.info("Restore collection: [ END ] {} {} document(s)", colNameFormatted, countFormatted);
@@ -834,10 +807,10 @@ public class BackupEngine {
 	 * filtered on their modification time. The archive layout is identical to a full backup and
 	 * must be restored with {@link #restoreDeltaFile} on top of the full backup it is based on.
 	 * <p>
-	 * By convention the sequence should end with {@code "_delta"} (e.g.
-	 * {@code "2025-06-20_10:15:00.000_delta"}) so that retention and
-	 * {@link #getLastFullBackupDate()} can tell delta archives apart from full ones.
-	 * @param sequence the sequence identifier appended to the backup filename
+	 * The {@code "_delta"} filename suffix — which retention and {@link #getLastFullBackupDate()}
+	 * rely on to tell delta archives apart from full ones — is appended to the sequence
+	 * automatically when missing.
+	 * @param sequence the sequence identifier appended to the backup filename (required)
 	 * @param since only documents/files modified at or after this date are included
 	 * @return the date at which the backup started
 	 * @throws IOException if the archive cannot be written
@@ -845,7 +818,21 @@ public class BackupEngine {
 	 */
 	public Date storeDelta(final String sequence, final Date since) throws IOException, DataAccessException {
 		final Document filter = buildDeltaFilter(since);
-		return executeStoreInternal(sequence, tarOut -> backupCollectionsToStream(tarOut, filter), since);
+		return executeStoreInternal(ensureDeltaSequence(sequence), tarOut -> backupCollectionsToStream(tarOut, filter),
+				since);
+	}
+
+	/**
+	 * Guarantee the {@code "_delta"} marker on a delta sequence: the filename suffix is what
+	 * classifies the archive (retention, restore chain), so the engine enforces it instead of
+	 * trusting every caller to follow the convention.
+	 */
+	private static String ensureDeltaSequence(final String sequence) {
+		if (sequence == null || sequence.isEmpty()) {
+			throw new IllegalArgumentException(
+					"A delta backup requires a sequence identifier (the filename suffix drives retention and restore-chain resolution)");
+		}
+		return sequence.endsWith(SUFFIX_DELTA) ? sequence : sequence + SUFFIX_DELTA;
 	}
 
 	/**
@@ -863,8 +850,9 @@ public class BackupEngine {
 	/**
 	 * Delta variant of {@link #storeAll(String)}: backup the documents of all discovered
 	 * collections (excluding {@code system.*}) that changed since the given date.
-	 * See {@link #storeDelta(String, Date)} for the selection rules and naming convention.
-	 * @param sequence the sequence identifier appended to the backup filename
+	 * See {@link #storeDelta(String, Date)} for the selection rules; the {@code "_delta"}
+	 * filename suffix is appended automatically when missing.
+	 * @param sequence the sequence identifier appended to the backup filename (required)
 	 * @param since only documents/files modified at or after this date are included
 	 * @return the date at which the backup started
 	 * @throws IOException if the archive cannot be written
@@ -872,7 +860,8 @@ public class BackupEngine {
 	 */
 	public Date storeAllDelta(final String sequence, final Date since) throws IOException, DataAccessException {
 		final Document filter = buildDeltaFilter(since);
-		return executeStoreInternal(sequence, tarOut -> backupAllCollectionsToStream(tarOut, filter), since);
+		return executeStoreInternal(ensureDeltaSequence(sequence),
+				tarOut -> backupAllCollectionsToStream(tarOut, filter), since);
 	}
 
 	/**
@@ -914,12 +903,19 @@ public class BackupEngine {
 	 * the full backup the delta is based on). Documents are upserted by {@code _id}: existing
 	 * documents are replaced, missing ones are inserted, and nothing is ever deleted. Media files
 	 * present in the delta are extracted over the existing ones (previous data is NOT moved away).
+	 * <p>
+	 * <b>Warning:</b> no consistency check is possible between the delta and the current database
+	 * state — applying a delta on a database that is not the restored base full it was built on
+	 * silently replaces newer documents with the archived versions. Prefer {@link #restoreLatest()}
+	 * which always pairs a full with its own delta.
 	 * @param deltaFileName path to the delta tar.gz archive to apply
 	 * @throws IOException if the archive cannot be read
 	 * @throws DataAccessException if the database connection fails
 	 */
 	public void restoreDeltaFile(final Path deltaFileName) throws IOException, DataAccessException {
 		LOGGER.info("Restore delta: [START] BD: '{}' from file: '{}'", this.baseName, deltaFileName);
+		LOGGER.warn("Applying a delta upserts documents over the CURRENT database state without any "
+				+ "consistency check — make sure the base full backup of this delta was restored just before.");
 		try (TarArchiveInputStream tarIn = openTarGzInputStream(deltaFileName)) {
 			restoreStreamToCollections(tarIn, null, true);
 		}
@@ -1121,7 +1117,11 @@ public class BackupEngine {
 	private static BackupFileInfo findLatestFull(final List<BackupFileInfo> files) {
 		BackupFileInfo best = null;
 		for (final BackupFileInfo file : files) {
-			if (!file.delta() && (best == null || file.compareTo(best) > 0)) {
+			// A partial archive (subset of collections) can not serve as a full-restore base
+			if (file.delta() || file.partial()) {
+				continue;
+			}
+			if (best == null || file.compareTo(best) > 0) {
 				best = file;
 			}
 		}
