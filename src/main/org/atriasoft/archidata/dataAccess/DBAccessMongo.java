@@ -1654,11 +1654,13 @@ public class DBAccessMongo implements Closeable {
 		try {
 			// Generate the filtering of the data:
 			final Bson filters = condition.getFilter(collectionName, options, deletedFieldName);
-			if (filters != null) {
-				LOGGER.trace("filter = {}",
-						filters.toBsonDocument().toJson(JsonWriterSettings.builder().indent(true).build()));
-			} else {
-				LOGGER.trace("filter = None");
+			if (LOGGER.isTraceEnabled()) {
+				if (filters != null) {
+					LOGGER.trace("filter = {}",
+							filters.toBsonDocument().toJson(JsonWriterSettings.builder().indent(true).build()));
+				} else {
+					LOGGER.trace("filter = None");
+				}
 			}
 			final Document sorts = generateSortOrNull(options);
 			QueryStatistics.record(collectionName, Operation.FIND, condition.getFilter(), sorts,
@@ -1699,8 +1701,10 @@ public class DBAccessMongo implements Closeable {
 			try (cursor) {
 				while (cursor.hasNext()) {
 					final Document doc = cursor.next();
-					LOGGER.trace(" - receive data from DB: {}",
-							doc.toJson(JsonWriterSettings.builder().indent(true).build()));
+					if (LOGGER.isTraceEnabled()) {
+						LOGGER.trace(" - receive data from DB: {}",
+								doc.toJson(JsonWriterSettings.builder().indent(true).build()));
+					}
 					final Object data = createObjectFromDocument(doc, clazz, options, lazyCall, batchCollector);
 					outs.add(data);
 				}
